@@ -1,0 +1,14 @@
+# Node
+node_modules/
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# HF / model weights
+model/
+*.safetensors
+
+# Environment / secrets
+.env
