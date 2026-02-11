@@ -1,6 +1,6 @@
 """
-Ollama-Based Mental Health Assessment Server
-Uses local LLM (via Ollama) for intelligent, context-aware mental health screening
+Simplified Ollama Mental Health Server
+Optimized for slower systems
 """
 
 from flask import Flask, request, jsonify
@@ -8,6 +8,7 @@ from flask_cors import CORS
 import logging
 import requests
 import json
+import time
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -15,147 +16,171 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 CORS(app)
 
-# Ollama configuration
 OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL_NAME = "llama3.2:3b"  # You can change this to any model you have installed
+MODEL_NAME = "tinyllama"
 
-# Backup keyword system (if Ollama fails)
+# Simplified keywords for fallback
 CONDITION_KEYWORDS = {
-    "Depression": ["sad", "hopeless", "empty", "interest", "pleasure", "tired", "energy", "sleep", "worthless", "guilt"],
-    "Anxiety": ["nervous", "anxious", "edge", "worry", "panic", "restless", "tense", "fear", "relax"],
-    "ADHD": ["focus", "attention", "distracted", "concentrate", "organize", "forget", "hyperactive", "impulsive"],
-    "PTSD": ["flashback", "trauma", "nightmare", "intrusive", "memories", "trigger", "upset", "avoid"],
-    "Aspergers": ["social", "cues", "routine", "literal", "sensory", "focused interests"],
+    "Depression": ["sad", "hopeless", "empty", "tired", "worthless", "sleep"],
+    "Anxiety": ["nervous", "anxious", "worry", "panic", "restless", "fear"],
+    "ADHD": ["focus", "attention", "distracted", "concentrate", "forget"],
+    "PTSD": ["flashback", "trauma", "nightmare", "memories", "avoid"],
+    "Aspergers": ["social", "routine", "literal", "sensory"],
 }
 
 
-def analyze_with_ollama(questions, answers):
-    """
-    Use Ollama LLM to analyze mental health assessment responses
-    Returns: (condition, confidence, severity, reasoning)
-    """
+def test_ollama_connection():
+    """Quick test if Ollama is responsive"""
+    try:
+        response = requests.post(
+            OLLAMA_URL,
+            json={
+                "model": MODEL_NAME,
+                "prompt": "Say 'OK'",
+                "stream": False
+            },
+            timeout=10
+        )
+        return response.status_code == 200
+    except:
+        return False
+
+
+def analyze_with_ollama_simple(questions, answers):
+    """Simplified Ollama analysis with shorter prompt"""
     
-    # Build context from Q&A
-    qa_pairs = []
-    for q, a in zip(questions, answers):
-        qa_pairs.append(f"Q: {q}\nA: {a}")
+    # Count yes/no
+    yes_count = sum(1 for a in answers if a == "yes")
     
-    qa_text = "\n\n".join(qa_pairs)
+    # Build minimal context (only YES answers to save tokens)
+    yes_questions = [q for q, a in zip(questions, answers) if a == "yes"]
     
-    # Craft a clinical prompt for the LLM
-    prompt = f"""You are a mental health screening assistant. Analyze the following questionnaire responses and provide a preliminary assessment.
+    if len(yes_questions) == 0:
+        return "No disorder detected", 0.9, "No symptoms", "No symptoms reported", "Keep up the good work!"
+    
+    # Very short prompt
+    prompt = f"""You are a mental health screening assistant. Analyze these symptoms and pick ONE primary condition.
 
-IMPORTANT RULES:
-1. You are NOT providing a diagnosis - only a screening indication
-2. Base your analysis ONLY on the conditions: Depression, Anxiety, ADHD, PTSD, Aspergers
-3. If symptoms don't clearly match any condition, indicate "No disorder detected"
-4. Be compassionate and professional in your language
+Reported symptoms:
+{chr(10).join('- ' + q for q in yes_questions[:10])}
 
-QUESTIONNAIRE RESPONSES:
-{qa_text}
+Choose the SINGLE MOST LIKELY condition from: Depression, Anxiety, ADHD, PTSD, Aspergers, or "No disorder detected"
 
-Based on these responses, provide your analysis in this EXACT JSON format (no additional text):
-{{
-    "condition": "Depression|Anxiety|ADHD|PTSD|Aspergers|No disorder detected",
-    "confidence": 0.0-1.0,
-    "severity": "Minimal symptoms|Mild signs detected|Moderate symptoms present|Significant symptoms detected",
-    "reasoning": "Brief explanation of why you selected this condition",
-    "recommendation": "Brief supportive message and next steps"
-}}
+Respond ONLY with valid JSON (no markdown, no extra text):
+{{"condition":"Depression","confidence":0.85,"severity":"Moderate"}}
 
-Respond with ONLY the JSON object, nothing else."""
+Rules:
+- Pick ONLY ONE condition (the most prominent)
+- If symptoms are mixed, choose the strongest pattern
+- confidence: 0.0 to 1.0
+- severity: "Mild" or "Moderate" or "Significant"
+
+Your JSON response:"""
 
     try:
-        # Call Ollama API
+        logger.info(f"Sending to Ollama: {len(yes_questions)} symptoms")
+        start_time = time.time()
+        
         response = requests.post(
             OLLAMA_URL,
             json={
                 "model": MODEL_NAME,
                 "prompt": prompt,
                 "stream": False,
-                "format": "json",  # Request JSON format
                 "options": {
-                    "temperature": 0.3,  # Lower temperature for more consistent medical responses
-                    "top_p": 0.9,
+                    "temperature": 0.2,
+                    "num_predict": 100,  # Limit response length
                 }
             },
-            timeout=30
+            timeout=120  # 2 minutes max
         )
+        
+        elapsed = time.time() - start_time
+        logger.info(f"Ollama responded in {elapsed:.1f} seconds")
         
         if response.status_code == 200:
             result = response.json()
             model_response = result.get("response", "")
             
-            # Parse the JSON response
+            # Clean response
+            model_response = model_response.strip()
+            if model_response.startswith("```"):
+                model_response = model_response.split("```")[1]
+            if model_response.startswith("json"):
+                model_response = model_response[4:].strip()
+            
+            logger.info(f"Raw response: {model_response[:200]}")
+            
             try:
                 analysis = json.loads(model_response)
-                
-                # Validate the response
                 condition = analysis.get("condition", "No disorder detected")
                 confidence = float(analysis.get("confidence", 0.5))
                 severity = analysis.get("severity", "Uncertain")
-                reasoning = analysis.get("reasoning", "")
-                recommendation = analysis.get("recommendation", "")
                 
-                logger.info(f"Ollama analysis: {condition} (confidence: {confidence:.2f})")
-                logger.info(f"Reasoning: {reasoning}")
+                # Validate condition is one of our expected values
+                valid_conditions = ["Depression", "Anxiety", "ADHD", "PTSD", "Aspergers", "No disorder detected"]
+                if condition not in valid_conditions:
+                    # Try to find a valid condition in the response
+                    for valid in valid_conditions:
+                        if valid.lower() in condition.lower():
+                            condition = valid
+                            break
+                    else:
+                        # Default to most common if still invalid
+                        logger.warning(f"Invalid condition '{condition}', defaulting to No disorder detected")
+                        condition = "No disorder detected"
+                        confidence = 0.5
+                
+                # Validate severity
+                valid_severities = ["Mild", "Moderate", "Significant", "Minimal", "Uncertain"]
+                if severity not in valid_severities:
+                    severity = "Moderate"
+                
+                reasoning = f"AI analysis based on {len(yes_questions)} reported symptoms"
+                recommendation = "Professional evaluation recommended if symptoms persist"
                 
                 return condition, confidence, severity, reasoning, recommendation
                 
             except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse Ollama JSON response: {e}")
-                logger.error(f"Raw response: {model_response}")
+                logger.error(f"JSON parse failed: {e}")
+                logger.error(f"Response was: {model_response}")
                 raise
         else:
-            logger.error(f"Ollama API error: {response.status_code}")
-            raise Exception(f"Ollama returned status {response.status_code}")
+            raise Exception(f"Ollama returned {response.status_code}")
             
     except Exception as e:
-        logger.error(f"Ollama analysis failed: {e}")
+        logger.error(f"Ollama failed: {e}")
         raise
 
 
 def fallback_keyword_analysis(questions, answers):
-    """
-    Fallback to keyword-based analysis if Ollama fails
-    """
+    """Quick keyword-based analysis"""
     yes_count = sum(1 for a in answers if a == "yes")
     total = len(answers)
-    symptom_ratio = yes_count / total if total > 0 else 0
+    ratio = yes_count / total if total > 0 else 0
     
-    if symptom_ratio < 0.25:
-        return "No disorder detected", 0.85, "Minimal symptoms", "Based on keyword analysis", "You appear to be doing well. Continue practicing self-care."
+    if ratio < 0.25:
+        return "No disorder detected", 0.85, "Minimal", "Few symptoms", "You're doing well"
     
-    condition_scores = {condition: 0 for condition in CONDITION_KEYWORDS.keys()}
+    scores = {c: 0 for c in CONDITION_KEYWORDS}
     
-    for question, answer in zip(questions, answers):
-        if answer == "yes":
-            question_lower = question.lower()
+    for q, a in zip(questions, answers):
+        if a == "yes":
+            q_lower = q.lower()
             for condition, keywords in CONDITION_KEYWORDS.items():
-                for keyword in keywords:
-                    if keyword in question_lower:
-                        condition_scores[condition] += 1
-                        break
+                if any(kw in q_lower for kw in keywords):
+                    scores[condition] += 1
     
-    sorted_conditions = sorted(condition_scores.items(), key=lambda x: x[1], reverse=True)
-    top_condition, top_score = sorted_conditions[0]
+    top_condition = max(scores, key=scores.get)
+    top_score = scores[top_condition]
     
     if top_score == 0:
-        return "No disorder detected", 0.5, "Uncertain - general stress possible", "No clear pattern detected", "If you're concerned, please consult a professional."
+        return "No disorder detected", 0.5, "Uncertain", "No clear pattern", "Consult if concerned"
     
-    confidence = min(0.95, (top_score / yes_count) * 0.9 + 0.3) if yes_count > 0 else 0.5
+    confidence = min(0.9, (top_score / yes_count) * 0.8 + 0.4) if yes_count > 0 else 0.5
+    severity = "Mild" if ratio < 0.4 else "Moderate" if ratio < 0.6 else "Significant"
     
-    if symptom_ratio < 0.4:
-        severity = "Mild signs detected"
-    elif symptom_ratio < 0.6:
-        severity = "Moderate symptoms present"
-    else:
-        severity = "Significant symptoms detected"
-    
-    reasoning = f"Detected {top_score} indicators of {top_condition}"
-    recommendation = "This is a preliminary assessment. Professional consultation is recommended."
-    
-    return top_condition, confidence, severity, reasoning, recommendation
+    return top_condition, confidence, severity, f"{top_score} indicators", "Professional consultation recommended"
 
 
 @app.route("/predict", methods=["POST"])
@@ -166,44 +191,33 @@ def predict():
         questions = data.get("questions", [])
         noSymptoms = data.get("noSymptoms", False)
 
-        logger.info(f"Received request: {len(questions)} questions, {len(answers)} answers")
+        logger.info(f"Assessment: {len(questions)} questions")
 
-        # Handle no symptoms case
         if noSymptoms:
             return jsonify({
-                "verdict": "You seem to be doing well! No significant mental health concerns detected.",
+                "verdict": "You're doing well! No significant concerns detected.",
                 "labels": ["No disorder detected"],
-                "severity": "No symptoms detected",
+                "severity": "No symptoms",
                 "confidence": 1.0,
                 "method": "direct"
             })
 
-        # Try Ollama first, fallback to keywords if it fails
+        # Try Ollama, fallback to keywords
         try:
-            logger.info("Attempting Ollama analysis...")
-            condition, confidence, severity, reasoning, recommendation = analyze_with_ollama(questions, answers)
-            method = "ollama-llm"
-            logger.info("✅ Ollama analysis successful")
+            logger.info("Trying Ollama...")
+            condition, confidence, severity, reasoning, recommendation = analyze_with_ollama_simple(questions, answers)
+            method = "ollama-ai"
+            logger.info(f"✅ Ollama success: {condition}")
         except Exception as e:
-            logger.warning(f"Ollama failed, using keyword fallback: {e}")
+            logger.warning(f"⚠️  Ollama failed, using keywords: {e}")
             condition, confidence, severity, reasoning, recommendation = fallback_keyword_analysis(questions, answers)
             method = "keyword-fallback"
         
-        # Create verdict message
+        # Build verdict
         if condition == "No disorder detected":
-            if "Uncertain" in severity:
-                verdict = f"No clear condition detected. {severity}. {recommendation}"
-            else:
-                verdict = f"You seem to be doing well! {recommendation}"
+            verdict = f"You seem to be doing well! {recommendation}"
         else:
-            verdict = f"{severity}. Based on your responses, you may be experiencing symptoms related to {condition}. {recommendation}"
-            
-            if confidence > 0.7:
-                verdict += " Consider speaking with a mental health professional for proper evaluation."
-            elif confidence > 0.5:
-                verdict += " This is a preliminary assessment. Professional consultation is recommended."
-            else:
-                verdict += " Results are uncertain. If you're concerned, please consult a professional."
+            verdict = f"{severity} symptoms detected. You may be experiencing {condition}. {recommendation}"
 
         return jsonify({
             "verdict": verdict,
@@ -211,8 +225,7 @@ def predict():
             "severity": severity,
             "confidence": round(confidence, 2),
             "reasoning": reasoning,
-            "method": method,
-            "note": "AI-powered assessment using Ollama" if method == "ollama-llm" else "Using keyword-based analysis"
+            "method": method
         })
         
     except Exception as e:
@@ -222,71 +235,27 @@ def predict():
 
 @app.route("/health", methods=["GET"])
 def health_check():
-    """Check if server and Ollama are running"""
-    ollama_status = "unknown"
-    ollama_models = []
-    
-    try:
-        # Check if Ollama is available
-        response = requests.get("http://localhost:11434/api/tags", timeout=2)
-        if response.status_code == 200:
-            ollama_status = "connected"
-            models_data = response.json()
-            ollama_models = [m.get("name", "unknown") for m in models_data.get("models", [])]
-    except:
-        ollama_status = "not available"
+    ollama_ok = test_ollama_connection()
     
     return jsonify({
         "status": "healthy",
-        "message": "Mental health assessment server running",
-        "mode": "ollama-with-fallback",
-        "ollama_status": ollama_status,
-        "ollama_models": ollama_models,
-        "current_model": MODEL_NAME,
-        "conditions": list(CONDITION_KEYWORDS.keys())
+        "ollama_status": "connected" if ollama_ok else "timeout/not available",
+        "model": MODEL_NAME,
+        "fallback": "keyword analysis available"
     })
-
-
-@app.route("/models", methods=["GET"])
-def list_models():
-    """List available Ollama models"""
-    try:
-        response = requests.get("http://localhost:11434/api/tags", timeout=5)
-        if response.status_code == 200:
-            return jsonify(response.json())
-        else:
-            return jsonify({"error": "Failed to fetch models"}), 500
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
     logger.info("="*60)
-    logger.info("OLLAMA-POWERED MENTAL HEALTH ASSESSMENT SERVER")
+    logger.info("SIMPLIFIED OLLAMA MENTAL HEALTH SERVER")
     logger.info("="*60)
-    logger.info(f"Primary: Ollama LLM ({MODEL_NAME})")
-    logger.info("Fallback: Keyword-based analysis")
-    logger.info("="*60)
+    logger.info(f"Model: {MODEL_NAME}")
+    logger.info("Testing Ollama connection...")
     
-    # Check Ollama availability at startup
-    try:
-        response = requests.get("http://localhost:11434/api/tags", timeout=2)
-        if response.status_code == 200:
-            models = response.json().get("models", [])
-            logger.info(f"✅ Ollama is running with {len(models)} model(s)")
-            model_names = [m.get("name") for m in models]
-            logger.info(f"Available models: {', '.join(model_names)}")
-            
-            if MODEL_NAME not in model_names and f"{MODEL_NAME}:latest" not in model_names:
-                logger.warning(f"⚠️  Model '{MODEL_NAME}' not found!")
-                logger.warning(f"Available models: {', '.join(model_names)}")
-                logger.warning("Update MODEL_NAME in the code or pull the model:")
-                logger.warning(f"  ollama pull {MODEL_NAME}")
-        else:
-            logger.warning("⚠️  Ollama is not responding - will use keyword fallback")
-    except Exception as e:
-        logger.warning(f"⚠️  Cannot connect to Ollama: {e}")
-        logger.warning("Server will use keyword-based fallback")
+    if test_ollama_connection():
+        logger.info("✅ Ollama is responding")
+    else:
+        logger.warning("⚠️  Ollama is slow/unavailable - will use keyword fallback")
     
     logger.info("="*60)
     
